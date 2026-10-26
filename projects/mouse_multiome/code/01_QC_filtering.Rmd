@@ -1,0 +1,740 @@
+---
+title: "QC filtering: 10x single-nucleus multiome (`r params$sample`)"
+author: "mp2924"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: kable
+params:
+  # Sample to process: a value of the `sample` column in `sample_sheet`
+  sample: "Run1_Sample1"
+  # All paths below (and in the sample sheet) are relative to the project root
+  sample_sheet: "config/samples_QC.csv"
+  gtf: "data/reference/gencode.vM38.annotation.gtf.gz"
+  annotation_cache: "data/reference/gencode.vM38_signac_annotation.rds"
+  seed: 42
+  # --- ATAC-only filters (fixed) -------------------------------------------
+  tss_min: 2
+  nucleosome_max: 2
+  frip_min: 0.2
+  # Extra cutoffs shown in the TSS profile / fragment size plots (the applied
+  # threshold above is always added)
+  tss_plot_cutoffs: [1.5, 2.0, 2.5]
+  nucleosome_plot_cutoffs: [2, 3, 4]
+  # --- Doublets (both modalities) ------------------------------------------
+  # "either": remove if called a doublet in RNA OR ATAC; "both": only if in both
+  doublet_rule: "either"
+  # --- Counts and features (both modalities, data-driven) -------------------
+  # Keep cells within median +/- nmads * MAD of log10(value), per sample
+  nmads: 3
+  # --- RNA-only filters (fixed) --------------------------------------------
+  mt_max: 20
+  # --- SoupX: "auto" to estimate with autoEstCont, or a number (e.g. 0.1) ---
+  soupx_rho: "auto"
+  # Genes shown before/after ambient RNA correction
+  soupx_genes: ["Kit", "Stra8", "Sycp3", "Meiob", "Acrv1", "Tnp1", "Prm2"]
+---
+
+<!--
+Run every sample in the sample sheet (from the project root):
+  Rscript code/run_01_QC_filtering.R
+Or a single sample from the R console:
+  rmarkdown::render("code/01_QC_filtering.Rmd", params = list(sample = "Run1_Sample1"))
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 4, dpi = 100)
+# Resolve all paths from the project root, wherever the Rmd is rendered from
+knitr::opts_knit$set(root.dir = normalizePath(file.path(dirname(knitr::current_input(dir = TRUE)), "..")))
+```
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Signac)
+  library(SoupX)
+  library(scDblFinder)
+  library(SingleCellExperiment)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(rtracklayer)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(knitr)
+})
+
+set.seed(params$seed)
+theme_set(theme_bw(base_size = 11))
+
+# Per-sample paths from the sample sheet (columns: sample, cellranger_dir, out_dir)
+sample_info <- read_csv(params$sample_sheet, show_col_types = FALSE) |>
+  filter(sample == params$sample)
+if (nrow(sample_info) != 1) {
+  stop("Sample '", params$sample, "' must appear exactly once in ", params$sample_sheet)
+}
+cellranger_dir <- sample_info$cellranger_dir
+out_dir <- sample_info$out_dir
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+cr_file <- function(f) {
+  path <- file.path(cellranger_dir, f)
+  if (!file.exists(path)) stop("Missing Cell Ranger ARC output: ", path)
+  path
+}
+out_file <- function(suffix) file.path(out_dir, paste0(params$sample, "_", suffix))
+```
+
+# Thresholds
+
+Fixed thresholds are set in the YAML `params` header. Thresholds for **number of counts** and **number of features** are data-driven: for each sample they are set to median ± `r params$nmads` MADs of the log10-transformed metric, computed on the cells that reach that step. Filters are applied **sequentially** in the order below, so each step only sees the cells that passed the previous steps. Doublets, number of counts and number of features are filtered on **both** RNA and ATAC.
+
+```{r thresholds}
+# lower/upper of "MAD" rows are filled in at their filtering step
+thresholds <- tribble(
+  ~step,                ~modality, ~metric,             ~label,                    ~method, ~lower,          ~upper,                ~log,
+  "TSS enrichment",     "ATAC",    "TSS.enrichment",    "TSS enrichment",          "Fixed", params$tss_min,  Inf,                   FALSE,
+  "Nucleosome signal",  "ATAC",    "nucleosome_signal", "Nucleosome signal",       "Fixed", -Inf,            params$nucleosome_max, FALSE,
+  "FRiP",               "ATAC",    "FRiP",              "FRiP",                    "Fixed", params$frip_min, Inf,                   FALSE,
+  "Number of counts",   "RNA",     "nCount_RNA",        "RNA UMI counts",          "MAD",   NA,              NA,                    TRUE,
+  "Number of counts",   "ATAC",    "nCount_ATAC",       "ATAC fragments in peaks", "MAD",   NA,              NA,                    TRUE,
+  "Number of features", "RNA",     "nFeature_RNA",      "RNA genes detected",      "MAD",   NA,              NA,                    TRUE,
+  "Number of features", "ATAC",    "nFeature_ATAC",     "ATAC peaks detected",     "MAD",   NA,              NA,                    TRUE,
+  "Mitochondrial %",    "RNA",     "percent.mt",        "% mitochondrial UMIs",    "Fixed", -Inf,            params$mt_max,         FALSE
+)
+
+stopifnot(params$doublet_rule %in% c("either", "both"))
+```
+
+# Helper functions
+
+```{r helpers}
+# Autosomes, X and Y in either naming style ("1"/"chr1"); excludes chrM/MT and scaffolds
+is_main_chrom <- function(chroms) grepl("^(chr)?([0-9]+|X|Y)$", chroms)
+
+# Rename UCSC-style seqlevels ("chr1", "chrM") to Ensembl style ("1", "MT") when
+# `ref_chroms` (e.g. the fragment file chromosomes) use Ensembl names, and vice versa
+match_chrom_style <- function(gr, ref_chroms) {
+  ref_ucsc <- any(startsWith(ref_chroms, "chr"))
+  gr_ucsc  <- any(startsWith(seqlevels(gr), "chr"))
+  old <- seqlevels(gr)
+  if (gr_ucsc && !ref_ucsc) {
+    new <- sub("^chr", "", sub("^chrM$", "MT", old))
+  } else if (!gr_ucsc && ref_ucsc) {
+    new <- ifelse(old == "MT", "chrM", ifelse(is_main_chrom(old), paste0("chr", old), old))
+  } else {
+    return(gr)
+  }
+  renameSeqlevels(gr, setNames(new, old))
+}
+
+# TRUE if every threshold of `step_name` is met (NA values fail)
+pass_thresholds <- function(md, step_name) {
+  thr <- filter(thresholds, step == step_name)
+  ok <- rep(TRUE, nrow(md))
+  for (i in seq_len(nrow(thr))) {
+    x <- md[[thr$metric[i]]]
+    ok <- ok & !is.na(x) & x >= thr$lower[i] & x <= thr$upper[i]
+  }
+  ok
+}
+
+# Fill in the bounds of the "MAD" rows of `step_name`: median +/- nmads * MAD of
+# log10(metric). Rounded inwards, which gives the same filter on integer counts.
+set_mad_thresholds <- function(thresholds, md, step_name) {
+  rows <- which(thresholds$step == step_name & thresholds$method == "MAD")
+  for (i in rows) {
+    lx <- log10(md[[thresholds$metric[i]]])
+    lx <- lx[is.finite(lx)]
+    bounds <- 10^(median(lx) + c(-1, 1) * params$nmads * mad(lx))
+    thresholds$lower[i] <- ceiling(bounds[1])
+    thresholds$upper[i] <- floor(bounds[2])
+  }
+  thresholds
+}
+
+pass_doublets <- function(md) {
+  dbl_rna  <- md$rna_dbl_class == "doublet"
+  dbl_atac <- md$atac_dbl_class == "doublet"
+  is_dbl <- if (params$doublet_rule == "either") dbl_rna | dbl_atac else dbl_rna & dbl_atac
+  !is_dbl
+}
+
+# One pass/fail function per filtering step, in the order they are applied
+step_pass <- list(
+  "TSS enrichment"     = function(md) pass_thresholds(md, "TSS enrichment"),
+  "Nucleosome signal"  = function(md) pass_thresholds(md, "Nucleosome signal"),
+  "FRiP"               = function(md) pass_thresholds(md, "FRiP"),
+  "Doublets"           = pass_doublets,
+  "Number of counts"   = function(md) pass_thresholds(md, "Number of counts"),
+  "Number of features" = function(md) pass_thresholds(md, "Number of features"),
+  "Mitochondrial %"    = function(md) pass_thresholds(md, "Mitochondrial %")
+)
+
+# Book-keeping: cells in/out per step and the step at which each cell was removed
+qc_steps <- tibble()
+removed_at <- character()
+
+filter_step <- function(obj, step_name, pass) {
+  stopifnot(length(pass) == ncol(obj), !anyNA(pass))
+  removed_at[colnames(obj)[!pass]] <<- step_name
+  qc_steps <<- bind_rows(qc_steps, tibble(
+    Step = step_name, `Cells in` = ncol(obj),
+    Removed = sum(!pass), Remaining = sum(pass)
+  ))
+  subset(obj, cells = colnames(obj)[pass])
+}
+
+# --- Plotting -------------------------------------------------------------
+status_factor <- function(pass) factor(ifelse(pass, "Pass", "Fail"), levels = c("Pass", "Fail"))
+status_cols <- c(Pass = "grey55", Fail = "#D55E00")
+
+status_scales <- function(status, aesthetics = c("fill", "colour")) {
+  n <- table(status)
+  labs <- setNames(sprintf("%s (n = %s)", names(n), format(as.integer(n), big.mark = ",", trim = TRUE)), names(n))
+  scale_colour_manual(values = status_cols, labels = labs, drop = FALSE, aesthetics = aesthetics)
+}
+
+# Histogram of one metric, coloured by pass/fail, with threshold lines
+plot_metric <- function(md, status, metric, label = metric, lines = numeric(), log = FALSE) {
+  lines <- lines[is.finite(lines)]
+  p <- ggplot(tibble(value = md[[metric]], status = status), aes(value, fill = status)) +
+    geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
+    labs(x = label, y = "Cells", fill = NULL) +
+    status_scales(status, "fill")
+  if (length(lines)) p <- p + geom_vline(xintercept = lines, linetype = "dashed")
+  if (log) p <- p + scale_x_log10(labels = scales::label_comma())
+  p
+}
+
+# Histograms of all metrics belonging to one filtering step, side by side
+plot_step <- function(md, pass, step_name) {
+  thr <- filter(thresholds, step == step_name)
+  status <- status_factor(pass)
+  plots <- lapply(seq_len(nrow(thr)), function(i) {
+    plot_metric(md, status, thr$metric[i], thr$label[i],
+                c(thr$lower[i], thr$upper[i]), thr$log[i])
+  })
+  wrap_plots(plots, nrow = 1) + plot_layout(guides = "collect")
+}
+
+# Scatter of two metrics, failing cells drawn on top
+plot_scatter <- function(md, status, x, y, xlab = x, ylab = y, logx = FALSE, logy = FALSE) {
+  d <- tibble(x = md[[x]], y = md[[y]], status = status) |> arrange(status)
+  p <- ggplot(d, aes(x, y, colour = status)) +
+    geom_point(size = 0.3, alpha = 0.5) +
+    labs(x = xlab, y = ylab, colour = NULL) +
+    status_scales(status, "colour") +
+    guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1)))
+  if (logx) p <- p + scale_x_log10(labels = scales::label_comma())
+  if (logy) p <- p + scale_y_log10(labels = scales::label_comma())
+  p
+}
+
+# Facet label for one cutoff, e.g. "TSS enrichment ≥ 2 (applied)\nPass n = 900, Fail n = 100"
+cutoff_label <- function(metric_label, op, cutoff, applied, pass) {
+  sprintf("%s %s %s%s\nPass n = %s, Fail n = %s", metric_label, op, cutoff,
+          if (cutoff == applied) " (applied)" else "",
+          format(sum(pass), big.mark = ","), format(sum(!pass), big.mark = ","))
+}
+
+# Mean normalised Tn5 insertion signal +/- 1 kb around TSSs, for cells passing and
+# failing TSS enrichment >= each cutoff. `tss_mat`: cells x positions matrix from
+# TSSEnrichment(fast = FALSE); `score`: TSS enrichment of the same cells.
+plot_tss_profiles <- function(tss_mat, score, cutoffs, applied, smooth = 11) {
+  profiles <- bind_rows(lapply(cutoffs, function(cutoff) {
+    pass <- score >= cutoff
+    label <- cutoff_label("TSS enrichment", "≥", cutoff, applied, pass)
+    bind_rows(lapply(c(TRUE, FALSE), function(p) {
+      if (!any(pass == p)) return(NULL)
+      signal <- colMeans(tss_mat[pass == p, , drop = FALSE])
+      tibble(cutoff = label, status = if (p) "Pass" else "Fail",
+             position = seq_along(signal) - (length(signal) + 1) / 2,
+             signal = as.numeric(stats::filter(signal, rep(1 / smooth, smooth), sides = 2)))
+    }))
+  })) |>
+    mutate(cutoff = factor(cutoff, levels = unique(cutoff)),
+           status = factor(status, levels = c("Pass", "Fail")))
+  ggplot(profiles, aes(position, signal, colour = status)) +
+    geom_line(na.rm = TRUE) +
+    facet_wrap(~cutoff, nrow = 1) +
+    scale_colour_manual(values = status_cols) +
+    labs(x = "Distance from TSS (bp)", y = "Mean normalised insertion signal", colour = NULL)
+}
+
+# Lengths of all fragments in `region` that belong to `cells`
+read_fragment_lengths <- function(path, region, cells) {
+  lines <- Rsamtools::scanTabix(path, param = region)[[1]]
+  if (!length(lines)) stop("No fragments found in ", as.character(region))
+  frags <- data.table::fread(text = lines, header = FALSE, sep = "\t", select = 2:4,
+                             col.names = c("start", "end", "cell"))
+  frags <- frags[frags$cell %in% cells, ]
+  tibble(cell = frags$cell, length = frags$end - frags$start)
+}
+
+# Fragment size distribution (fraction of fragments per 5-bp bin) for cells
+# passing and failing nucleosome signal <= each cutoff. `score` is named by cell.
+plot_fragment_sizes <- function(frags, score, cutoffs, applied, max_length = 800, binwidth = 5) {
+  frags <- frags |>
+    filter(length <= max_length) |>
+    mutate(bin = floor(length / binwidth) * binwidth, score = score[cell])
+  sizes <- bind_rows(lapply(cutoffs, function(cutoff) {
+    label <- cutoff_label("Nucleosome signal", "≤", cutoff, applied, score <= cutoff)
+    frags |>
+      mutate(status = if_else(score <= cutoff, "Pass", "Fail")) |>
+      count(status, bin) |>
+      group_by(status) |>
+      mutate(fraction = n / sum(n), cutoff = label) |>
+      ungroup()
+  })) |>
+    mutate(cutoff = factor(cutoff, levels = unique(cutoff)),
+           status = factor(status, levels = c("Pass", "Fail")))
+  ggplot(sizes, aes(bin, fraction, colour = status)) +
+    geom_line(na.rm = TRUE) +
+    facet_wrap(~cutoff, nrow = 1) +
+    scale_colour_manual(values = status_cols) +
+    labs(x = "Fragment length (bp)", y = "Fraction of fragments", colour = NULL)
+}
+```
+
+# Load data
+
+Starting point is the set of barcodes called as cells by Cell Ranger ARC.
+
+```{r annotation}
+# Gene annotation from GENCODE (mm39) in the format Signac expects; cached because
+# importing the GTF is slow. "transcript" entries are kept so that transcript 5'
+# ends (TSSs) are part of the annotation. Stored with GENCODE (UCSC-style) names.
+anno_types <- c(transcript = "transcript", exon = "exon", CDS = "cds", UTR = "utr")
+anno_cache <- params$annotation_cache
+annotation <- if (file.exists(anno_cache)) readRDS(anno_cache)
+# Rebuild caches made before transcript entries were included
+if (is.null(annotation) || !"transcript" %in% annotation$type) {
+  gtf <- rtracklayer::import(params$gtf)
+  gtf <- gtf[gtf$type %in% names(anno_types)]
+  annotation <- granges(gtf)
+  annotation$gene_name    <- gtf$gene_name
+  annotation$gene_id      <- gtf$gene_id
+  annotation$gene_biotype <- gtf$gene_type
+  annotation$tx_id        <- gtf$transcript_id
+  annotation$type         <- unname(anno_types[as.character(gtf$type)])
+  saveRDS(annotation, anno_cache)
+  rm(gtf)
+}
+```
+
+```{r load}
+counts <- Read10X_h5(cr_file("filtered_feature_bc_matrix.h5"))
+
+obj <- CreateSeuratObject(counts = counts[["Gene Expression"]], assay = "RNA",
+                          project = params$sample)
+
+# Peaks on the main chromosomes only (drops unplaced scaffolds, e.g. JH584295.1)
+atac_counts <- counts[["Peaks"]]
+peak_ranges <- GRanges(rownames(atac_counts))
+keep_peaks  <- is_main_chrom(as.character(seqnames(peak_ranges)))
+atac_counts <- atac_counts[keep_peaks, ]
+peak_ranges <- peak_ranges[keep_peaks]
+rm(counts)
+
+# Cell Ranger ARC references built from Ensembl name chromosomes "1", "X", "MT",
+# whereas GENCODE uses "chr1", "chrX", "chrM". Rename the annotation to match the
+# fragments file, otherwise no TSS is found in the fragments and TSS enrichment
+# is 0 for every cell.
+frag_path   <- cr_file("atac_fragments.tsv.gz")
+frag_chroms <- Rsamtools::headerTabix(frag_path)$seqnames
+annotation  <- match_chrom_style(annotation, frag_chroms)
+annotation  <- keepSeqlevels(annotation, intersect(seqlevels(annotation), frag_chroms),
+                             pruning.mode = "coarse")
+annotation  <- annotation[is_main_chrom(as.character(seqnames(annotation)))]
+stopifnot("No annotation chromosomes match the fragments file" = length(annotation) > 0)
+
+obj[["ATAC"]] <- CreateChromatinAssay(
+  counts     = atac_counts,
+  ranges     = peak_ranges,
+  fragments  = frag_path,
+  annotation = annotation
+)
+
+obj$nCount_ATAC   <- Matrix::colSums(atac_counts)
+obj$nFeature_ATAC <- Matrix::colSums(atac_counts > 0)
+rm(atac_counts)
+
+cat("Cell Ranger ARC cell calls:", ncol(obj), "\n")
+cat("Fragment file chromosomes:", paste(head(frag_chroms, 25), collapse = " "), "\n")
+```
+
+```{r tss-positions}
+# One TSS per protein-coding gene: the 5' end of the gene's outermost transcript
+# (strand-aware). Passed to TSSEnrichment() explicitly, so the TSSs do not depend
+# on how the Signac version derives them from the annotation.
+tx <- annotation[annotation$type == "transcript" & annotation$gene_biotype == "protein_coding"]
+tss_positions <- unlist(range(split(tx, tx$gene_id)))
+tss_positions <- resize(tss_positions, width = 1, fix = "start")
+rm(tx)
+
+tss_found <- mean(as.character(seqnames(tss_positions)) %in% frag_chroms)
+cat("Protein-coding TSSs:", length(tss_positions),
+    sprintf("(%.1f%% on chromosomes present in the fragments file)\n", 100 * tss_found))
+stopifnot("TSS chromosomes do not match the fragments file" = tss_found > 0.9)
+```
+
+# Compute QC metrics
+
+```{r metrics-rna}
+DefaultAssay(obj) <- "RNA"
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+```
+
+```{r metrics-atac}
+DefaultAssay(obj) <- "ATAC"
+# NucleosomeSignal() and TSSEnrichment() are deprecated in Signac >= 1.17 in favour
+# of ATACqc(), which needs the external `fragtk` binary. They still compute the
+# same metrics, so the deprecation warnings are silenced.
+obj <- suppressWarnings(NucleosomeSignal(obj))
+# fast = FALSE also stores the per-cell signal +/- 1 kb around TSSs, used for the
+# TSS profile plots (same TSS.enrichment score as fast = TRUE)
+obj <- suppressWarnings(TSSEnrichment(obj, tss.positions = tss_positions, fast = FALSE))
+stopifnot("TSS enrichment is 0 for all cells: check chromosome names" =
+            any(obj$TSS.enrichment > 0))
+
+# Keep the cells x positions matrix (dropping its "expected"/"motif" rows) and
+# remove it from the object so the saved object stays small
+tss_mat <- GetAssayData(obj, assay = "ATAC", layer = "positionEnrichment")[["TSS"]]
+tss_mat <- tss_mat[colnames(obj), , drop = FALSE]
+obj@assays$ATAC@positionEnrichment <- list()
+
+# FRiP from Cell Ranger ARC per-barcode metrics
+pbm <- read_csv(cr_file("per_barcode_metrics.csv"), show_col_types = FALSE)
+idx <- match(colnames(obj), pbm$barcode)
+obj$atac_fragments <- pbm$atac_fragments[idx]
+obj$FRiP <- pbm$atac_peak_region_fragments[idx] / pbm$atac_fragments[idx]
+```
+
+## Doublet scores (RNA and ATAC)
+
+Doublets are scored with `scDblFinder` independently on each modality, on all Cell Ranger cell calls (before any other filtering), so that the simulated doublets reflect the full cell population. For ATAC the recommended settings (`aggregateFeatures = TRUE`, `processing = "normFeatures"`) are used. The scores are used at the *Doublets* filtering step below.
+
+```{r doublets}
+sce_rna <- SingleCellExperiment(list(counts = LayerData(obj, assay = "RNA", layer = "counts")))
+sce_rna <- scDblFinder(sce_rna)
+obj$rna_dbl_score <- sce_rna$scDblFinder.score
+obj$rna_dbl_class <- as.character(sce_rna$scDblFinder.class)
+
+sce_atac <- SingleCellExperiment(list(counts = LayerData(obj, assay = "ATAC", layer = "counts")))
+sce_atac <- scDblFinder(sce_atac, artificialDoublets = 1, aggregateFeatures = TRUE,
+                        nfeatures = 25, processing = "normFeatures")
+obj$atac_dbl_score <- sce_atac$scDblFinder.score
+obj$atac_dbl_class <- as.character(sce_atac$scDblFinder.class)
+rm(sce_rna, sce_atac)
+
+DefaultAssay(obj) <- "RNA"
+```
+
+## Overview before filtering
+
+```{r overview}
+md0 <- obj[[]]
+removed_at <- setNames(rep(NA_character_, ncol(obj)), colnames(obj))
+qc_steps <- tibble(Step = "Cell Ranger ARC cell calls", `Cells in` = NA_integer_,
+                   Removed = NA_integer_, Remaining = ncol(obj))
+
+md0 |>
+  select(all_of(unique(thresholds$metric)), rna_dbl_score, atac_dbl_score) |>
+  pivot_longer(everything(), names_to = "Metric") |>
+  group_by(Metric) |>
+  summarise(Min = min(value, na.rm = TRUE), Q25 = quantile(value, 0.25, na.rm = TRUE),
+            Median = median(value, na.rm = TRUE), Q75 = quantile(value, 0.75, na.rm = TRUE),
+            Max = max(value, na.rm = TRUE)) |>
+  kable(digits = 2, format.args = list(big.mark = ","), caption = "QC metrics of all Cell Ranger cell calls")
+```
+
+# Sequential filtering
+
+## 1. TSS enrichment
+
+Keep cells with TSS enrichment ≥ `r params$tss_min`. The plot shows the mean normalised Tn5 insertion signal ±1 kb around protein-coding TSSs for cells that pass and fail at the applied threshold and at the other cutoffs in `params$tss_plot_cutoffs`. Passing cells should show a sharp peak at the TSS; failing cells a flat profile.
+
+```{r step-tss, fig.height = 4.5, fig.width = 14}
+md <- obj[[]]
+pass <- step_pass[["TSS enrichment"]](md)
+plot_tss_profiles(tss_mat[rownames(md), , drop = FALSE], md$TSS.enrichment,
+                  cutoffs = sort(unique(c(params$tss_plot_cutoffs, params$tss_min))),
+                  applied = params$tss_min)
+obj <- filter_step(obj, "TSS enrichment", pass)
+rm(tss_mat)
+```
+
+## 2. Nucleosome signal
+
+Keep cells with nucleosome signal ≤ `r params$nucleosome_max`. The plot shows the fragment size distribution of cells that pass and fail at the applied threshold and at the other cutoffs in `params$nucleosome_plot_cutoffs`. Good-quality nuclei show a nucleosome-free peak (< 147 bp) followed by mono- and di-nucleosome peaks; a high nucleosome signal means relatively more mono-nucleosome fragments. Fragments are read from the first 30 Mb of chromosome 1, which is plenty for a per-group distribution.
+
+```{r step-nucleosome, fig.height = 4.5, fig.width = 14}
+md <- obj[[]]
+pass <- step_pass[["Nucleosome signal"]](md)
+
+frag_region <- GRanges(paste0(intersect(c("1", "chr1"), frag_chroms)[1], ":1-30000000"))
+frag_lengths <- read_fragment_lengths(frag_path, frag_region, rownames(md))
+plot_fragment_sizes(frag_lengths, setNames(md$nucleosome_signal, rownames(md)),
+                    cutoffs = sort(unique(c(params$nucleosome_plot_cutoffs, params$nucleosome_max))),
+                    applied = params$nucleosome_max)
+obj <- filter_step(obj, "Nucleosome signal", pass)
+rm(frag_lengths)
+```
+
+## 3. FRiP
+
+Keep cells with fraction of fragments in peaks ≥ `r params$frip_min`.
+
+```{r step-frip}
+md <- obj[[]]
+pass <- step_pass[["FRiP"]](md)
+plot_step(md, pass, "FRiP")
+obj <- filter_step(obj, "FRiP", pass)
+```
+
+## 4. Doublets (RNA + ATAC)
+
+Remove cells called a doublet in **`r params$doublet_rule`** modality(ies) by `scDblFinder` (*Fail* = doublet). The plots show counts against features in each modality, to check whether doublets also carry more counts and features.
+
+```{r step-doublets, fig.height = 5}
+md <- obj[[]]
+pass <- step_pass[["Doublets"]](md)
+status <- status_factor(pass)
+
+md |>
+  mutate(Call = case_when(
+    rna_dbl_class == "doublet" & atac_dbl_class == "doublet" ~ "Doublet in both",
+    rna_dbl_class == "doublet" ~ "Doublet in RNA only",
+    atac_dbl_class == "doublet" ~ "Doublet in ATAC only",
+    TRUE ~ "Singlet in both"
+  )) |>
+  group_by(Call) |>
+  summarise(Cells = n(),
+            `Median RNA UMIs` = median(nCount_RNA), `Median RNA genes` = median(nFeature_RNA),
+            `Median ATAC fragments in peaks` = median(nCount_ATAC),
+            `Median ATAC peaks` = median(nFeature_ATAC)) |>
+  kable(digits = 0, format.args = list(big.mark = ","),
+        caption = "scDblFinder calls per modality, with median counts and features")
+
+p_rna <- plot_scatter(md, status, "nCount_RNA", "nFeature_RNA",
+                      "RNA UMI counts", "RNA genes detected", logx = TRUE, logy = TRUE) +
+  ggtitle("RNA")
+p_atac <- plot_scatter(md, status, "nCount_ATAC", "nFeature_ATAC",
+                       "ATAC fragments in peaks", "ATAC peaks detected", logx = TRUE, logy = TRUE) +
+  ggtitle("ATAC")
+p_rna + p_atac + plot_layout(guides = "collect")
+obj <- filter_step(obj, "Doublets", pass)
+```
+
+## 5. Number of counts (RNA + ATAC)
+
+Keep cells within median ± `r params$nmads` MADs of log10(count) in **both** RNA (UMIs) and ATAC (fragments in peaks). Thresholds are computed on the cells remaining after the previous steps.
+
+```{r step-counts}
+md <- obj[[]]
+thresholds <- set_mad_thresholds(thresholds, md, "Number of counts")
+filter(thresholds, step == "Number of counts") |>
+  select(Modality = modality, Metric = label, Lower = lower, Upper = upper) |>
+  kable(format.args = list(big.mark = ","), caption = "MAD-based thresholds")
+
+pass <- step_pass[["Number of counts"]](md)
+plot_step(md, pass, "Number of counts")
+obj <- filter_step(obj, "Number of counts", pass)
+```
+
+## 6. Number of features (RNA + ATAC)
+
+Keep cells within median ± `r params$nmads` MADs of log10(features) in **both** RNA (genes detected) and ATAC (peaks detected). Thresholds are computed on the cells remaining after the previous steps.
+
+```{r step-features}
+md <- obj[[]]
+thresholds <- set_mad_thresholds(thresholds, md, "Number of features")
+filter(thresholds, step == "Number of features") |>
+  select(Modality = modality, Metric = label, Lower = lower, Upper = upper) |>
+  kable(format.args = list(big.mark = ","), caption = "MAD-based thresholds")
+
+pass <- step_pass[["Number of features"]](md)
+plot_step(md, pass, "Number of features")
+obj <- filter_step(obj, "Number of features", pass)
+```
+
+## 7. Mitochondrial RNA
+
+Keep cells with ≤ `r params$mt_max`% of RNA UMIs from mitochondrial genes (`^mt-`).
+
+```{r step-mt}
+md <- obj[[]]
+pass <- step_pass[["Mitochondrial %"]](md)
+plot_step(md, pass, "Mitochondrial %")
+obj <- filter_step(obj, "Mitochondrial %", pass)
+```
+
+## 8. Ambient RNA correction (SoupX)
+
+SoupX corrects the RNA counts of the retained cells; it does not remove cells. The soup profile is estimated from the empty droplets in `raw_feature_bc_matrix.h5`, and the contamination fraction (rho) is `r if (identical(params$soupx_rho, "auto")) "estimated automatically with \x60autoEstCont\x60 using a quick RNA clustering" else paste("fixed at", params$soupx_rho)`. Uncorrected counts are kept in the `RNA_raw` assay; the `RNA` assay holds the corrected counts.
+
+```{r soupx-run}
+raw <- Read10X_h5(cr_file("raw_feature_bc_matrix.h5"))[["Gene Expression"]]
+toc <- LayerData(obj, assay = "RNA", layer = "counts")
+tod <- raw[rownames(toc), ]
+rm(raw)
+
+sc <- SoupChannel(tod = tod, toc = toc)
+
+# Quick clustering of the retained cells, needed by SoupX
+clust <- CreateSeuratObject(toc) |>
+  NormalizeData(verbose = FALSE) |>
+  FindVariableFeatures(verbose = FALSE) |>
+  ScaleData(verbose = FALSE) |>
+  RunPCA(verbose = FALSE) |>
+  FindNeighbors(dims = 1:30, verbose = FALSE) |>
+  FindClusters(resolution = 0.8, verbose = FALSE) |>
+  RunUMAP(dims = 1:30, verbose = FALSE)
+sc <- setClusters(sc, setNames(as.character(clust$seurat_clusters), colnames(clust)))
+sc <- setDR(sc, Embeddings(clust, "umap"))
+
+if (identical(params$soupx_rho, "auto")) {
+  sc <- autoEstCont(sc, doPlot = FALSE)
+} else {
+  sc <- setContaminationFraction(sc, as.numeric(params$soupx_rho))
+}
+soupx_rho <- unique(sc$metaData$rho)
+cat("SoupX contamination fraction (rho):", round(soupx_rho, 3), "\n")
+
+adj <- adjustCounts(sc, roundToInt = TRUE)
+```
+
+Expression of selected genes (`params$soupx_genes`) before and after correction, as log-normalised expression (log1p of counts per 10,000) on a UMAP of the retained cells. Each gene uses the same colour scale before and after. Ambient transcripts appear as low-level expression across clusters that should not express the gene, and should be reduced after correction.
+
+```{r soupx-plots, fig.height = 3.2 * (length(params$soupx_genes) + 1)}
+soup_genes <- intersect(params$soupx_genes, rownames(toc))
+if (length(soup_genes) < length(params$soupx_genes)) {
+  warning("Not in the RNA assay: ", paste(setdiff(params$soupx_genes, soup_genes), collapse = ", "))
+}
+
+lognorm <- function(m) {
+  as.matrix(log1p(t(t(m[soup_genes, , drop = FALSE]) / Matrix::colSums(m) * 1e4)))
+}
+umap <- as_tibble(Embeddings(clust, "umap"), rownames = "cell") |> setNames(c("cell", "UMAP_1", "UMAP_2"))
+expr <- bind_rows(
+  as_tibble(t(lognorm(toc)), rownames = "cell") |> mutate(condition = "Before SoupX"),
+  as_tibble(t(lognorm(adj)), rownames = "cell") |> mutate(condition = "After SoupX")
+) |>
+  pivot_longer(all_of(soup_genes), names_to = "gene", values_to = "expr") |>
+  left_join(umap, by = "cell") |>
+  mutate(condition = factor(condition, levels = c("Before SoupX", "After SoupX")))
+
+tibble(
+  Gene = soup_genes,
+  `UMIs before` = Matrix::rowSums(toc[soup_genes, , drop = FALSE]),
+  `UMIs after`  = Matrix::rowSums(adj[soup_genes, , drop = FALSE]),
+  `% cells expressing before` = 100 * Matrix::rowMeans(toc[soup_genes, , drop = FALSE] > 0),
+  `% cells expressing after`  = 100 * Matrix::rowMeans(adj[soup_genes, , drop = FALSE] > 0)
+) |>
+  kable(digits = 1, format.args = list(big.mark = ","),
+        caption = "Selected genes before and after SoupX correction")
+
+p_clusters <- ggplot(mutate(umap, cluster = setNames(clust$seurat_clusters, colnames(clust))[cell]),
+                     aes(UMAP_1, UMAP_2, colour = cluster)) +
+  geom_point(size = 0.3) +
+  guides(colour = guide_legend(override.aes = list(size = 2), ncol = 2)) +
+  ggtitle("Clusters used by SoupX")
+gene_plots <- lapply(soup_genes, function(g) {
+  d <- filter(expr, gene == g) |> arrange(expr)
+  ggplot(d, aes(UMAP_1, UMAP_2, colour = expr)) +
+    geom_point(size = 0.3) +
+    facet_wrap(~condition) +
+    scale_colour_viridis_c(limits = c(0, max(d$expr, 0.1))) +
+    labs(title = g, colour = "log1p\nexpression")
+})
+wrap_plots(c(list(p_clusters), gene_plots), ncol = 1)
+
+obj[["RNA_raw"]] <- CreateAssay5Object(counts = toc)
+obj[["RNA"]] <- CreateAssay5Object(counts = adj)
+obj$nCount_RNA_soupx   <- Matrix::colSums(adj)
+obj$nFeature_RNA_soupx <- Matrix::colSums(adj > 0)
+rm(tod, toc, adj, clust, expr)
+
+qc_steps <- bind_rows(qc_steps, tibble(
+  Step = "SoupX ambient RNA correction", `Cells in` = ncol(obj),
+  Removed = 0L, Remaining = ncol(obj)
+))
+```
+
+# Summary
+
+## Cells removed at each step
+
+*Removed* is the number of cells removed at that step given the previous steps; *Fail (independently)* is the number of the original cell calls that would fail the step if it were applied on its own.
+
+```{r summary-table}
+md0$removed_at <- replace_na(removed_at[rownames(md0)], "Retained")
+independent_fail <- vapply(step_pass, function(f) sum(!f(md0)), integer(1))
+
+n_start <- nrow(md0)
+summary_table <- qc_steps |>
+  mutate(`Fail (independently)` = unname(independent_fail[Step]),
+         `% of input removed` = round(100 * Removed / n_start, 2)) |>
+  bind_rows(tibble(Step = "Total", `Cells in` = n_start,
+                   Removed = n_start - ncol(obj), Remaining = ncol(obj),
+                   `% of input removed` = round(100 * (n_start - ncol(obj)) / n_start, 2)))
+
+kable(summary_table, format.args = list(big.mark = ","),
+      caption = paste0("Cells removed per filtering step (", params$sample, ")"))
+```
+
+## Thresholds used
+
+```{r threshold-table}
+fmt_num <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+criterion <- function(lo, hi) {
+  if (is.finite(lo) && is.finite(hi)) paste(fmt_num(lo), "–", fmt_num(hi))
+  else if (is.finite(lo)) paste("≥", fmt_num(lo))
+  else paste("≤", fmt_num(hi))
+}
+
+threshold_table <- bind_rows(
+  thresholds |>
+    rowwise() |>
+    transmute(Step = step, Modality = modality, Metric = label,
+              Method = if (method == "MAD") sprintf("Median ± %s MAD (log10)", params$nmads) else "Fixed",
+              `Keep if` = criterion(lower, upper)) |>
+    ungroup(),
+  tibble(Step = "Doublets", Modality = c("RNA", "ATAC", "RNA + ATAC"),
+         Metric = c("scDblFinder class", "scDblFinder class (aggregated peaks)", "Combined rule"),
+         Method = "scDblFinder",
+         `Keep if` = c("singlet", "singlet",
+                       if (params$doublet_rule == "either") "singlet in both modalities"
+                       else "singlet in at least one modality")),
+  tibble(Step = "SoupX ambient RNA correction", Modality = "RNA",
+         Metric = "Contamination fraction (rho)",
+         Method = if (identical(params$soupx_rho, "auto")) "SoupX autoEstCont" else "Fixed",
+         `Keep if` = sprintf("rho = %s; no cells removed", round(soupx_rho, 3)))
+) |>
+  mutate(Step = factor(Step, levels = c(names(step_pass), "SoupX ambient RNA correction"))) |>
+  arrange(Step) |>
+  mutate(Step = as.character(Step))
+
+kable(threshold_table, caption = paste0("Filtering thresholds (", params$sample, ")"))
+```
+
+# Save outputs
+
+```{r save}
+saveRDS(obj, out_file("qc_filtered.rds"))
+write_csv(mutate(summary_table, Sample = params$sample, .before = 1), out_file("qc_cells_removed.csv"))
+write_csv(mutate(threshold_table, Sample = params$sample, .before = 1), out_file("qc_thresholds.csv"))
+write_csv(rownames_to_column(md0, "barcode"), out_file("qc_metrics_all_cells.csv"))
+```
+
+```{r session-info}
+sessionInfo()
+```

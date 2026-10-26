@@ -1,0 +1,68 @@
+# mouse_multiome pipeline configuration. Edit here, not in the scripts.
+project_root: "/home/mp2924/mnt/storage/vaquerizas/Matt/TE_spermatogenesis_project/research/projects/mouse_multiome"
+
+# Large inputs live on the cluster storage (not in git)
+cellranger_dir: "/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/cellranger-arc"
+marker_xlsx: "/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/pre_processing/Ernst_mouse_cluster_marker_genes.xlsx"
+
+# Output locations (relative to project_root). data/ = big RDS objects (cluster only); results/ = plots/tables (pulled back)
+data_dir: "data"
+results_dir: "results"
+
+samples: ["Mouse1", "Mouse2"]
+# Path to the cellranger-arc outs folder for a sample. {sample} is substituted.
+# Must agree with config/samples_QC.csv (used by step 01). Verify with code/00_check_inputs.R
+outs_template: "{cellranger_dir}/{sample}/outs"
+
+genome:
+  # GRCm39 / GENCODE vM38 (same as the QC Rmd). QC thresholds, SoupX and doublet settings are the
+  # `params:` block at the top of code/01_QC_filtering.Rmd (single source of truth for QC).
+  blacklist_bed: ""                       # optional GRCm39 blacklist .bed, removed from the merged peak set ("" = skip)
+
+# Per-sample QC output written by step 01 (relative to project_root): {out_dir}/{sample}_qc_filtered.rds
+# (see config/samples_QC.csv for cellranger-arc input and output dirs)
+qc_rds_template: "data/qc/{sample}/{sample}_qc_filtered.rds"
+
+# ---- RNA ----
+rna:
+  normalisation: "SCT"      # "SCT" or "LogNormalize"
+  n_variable_features: 3000
+  npcs: 50
+  dims: 1:30
+  regress_out: []           # e.g. ["percent.mt"]
+
+# ---- ATAC ----
+atac:
+  call_peaks: true          # MACS2 per sample on cleaned cells then merge; false = use cellranger peaks
+  macs2_path: ""            # "" = auto-find on PATH
+  peak_min_width: 20
+  peak_max_width: 10000
+  min_cells_feature: 10
+  lsi_dims: 2:30            # drop LSI comp 1 (depth correlated)
+  n_lsi_components: 50
+
+# ---- integration ----
+integration:
+  method: "harmony"         # harmony on RNA PCA and ATAC LSI, then WNN
+  group_by: "sample"
+  rna_theta: 2
+  atac_theta: 2
+
+# ---- clustering ----
+clustering:
+  resolutions: [0.3, 0.5, 0.8, 1.2]
+  default_resolution: 0.8
+  algorithm: 4              # Leiden (needs leidenalg via reticulate); use 1 (Louvain) if unavailable
+  seed: 42
+
+# ---- annotation ----
+annotation:
+  # Parsing of the Ernst et al. marker xlsx. Run code/00_inspect_markers.R first and set these.
+  sheet: 1
+  cluster_col: "cluster"
+  gene_col: "gene"
+  # optional ranking column used to keep top n markers per reference cluster
+  rank_col: ""
+  top_n: 30
+  # genes are mouse symbols; set to NULL-equivalent "" if they are Ensembl IDs
+  id_type: "symbol"

@@ -1,0 +1,3 @@
+sample,cellranger_dir,out_dir
+Mouse1,/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/cellranger-arc/Mouse1/outs,data/qc/Mouse1
+Mouse2,/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/cellranger-arc/Mouse2/outs,data/qc/Mouse2

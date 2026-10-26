@@ -1,0 +1,35 @@
+name: mouse_multiome
+channels: [conda-forge, bioconda, defaults]
+dependencies:
+  - r-base=4.3
+  - r-seurat>=5
+  - r-signac
+  - r-harmony
+  - r-yaml
+  - r-soupx
+  - r-rmarkdown
+  - r-knitr
+  - r-readr
+  - r-data.table
+  - bioconductor-rsamtools
+  - bioconductor-singlecellexperiment
+  - pandoc
+  - r-glue
+  - r-pheatmap
+  - r-readxl
+  - r-tidyverse
+  - r-patchwork
+  - r-hdf5r
+  - r-remotes
+  - r-biocmanager
+  - r-future
+  - bioconductor-biovizbase
+  - bioconductor-genomeinfodbdata
+  - bioconductor-scdblfinder
+  - bioconductor-glmgampoi
+  - bioconductor-rtracklayer
+  - bioconductor-motifmatchr
+  - macs2
+  - python=3.10
+  - leidenalg
+  - python-igraph
