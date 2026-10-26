@@ -1,0 +1,40 @@
+# never track data or run outputs
+projects/*/data/
+projects/*/results/
+projects/*/checkpoints/
+projects/*/logs/
+_shared/genomes/
+
+# large or binary formats
+*.mcool
+*.cool
+*.hic
+*.bam
+*.cram
+*.fastq*
+*.fq*
+*.fna
+*.fa
+*.fasta
+*.fai
+*.pt
+*.ckpt
+*.npy
+*.h5
+*.gz
+*.bigWig
+*.bw
+*.bigBed
+*.bb
+
+# local noise
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
+
+# docs: track markdown only
+projects/*/docs/*
+!projects/*/docs/*.md
+
+# admin stays local
+_admin/
