@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=m6a_metagene
 #SBATCH --account=vaquerizas
-#SBATCH --partition=cpu
+#SBATCH --partition=nice
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00

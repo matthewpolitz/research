@@ -23,13 +23,13 @@ Owner: Matthew Politz (mp2924), PhD student, Vaquerizas lab. Git identity: Matth
 
 ## Verified by pasted output
 
-SSH login, cluster research root and genomes symlink, bare repo and hook, first push (deployed d993e62), Slurm account/partition info.
+SSH login, cluster research root and genomes symlink, bare repo and hook, first push (deployed d993e62), Slurm account/partition info, CPU smoke test (job 1331438), GPU smoke test (one NVIDIA RTX A5000 listed, deployed commit recorded in the log; GPU nodes were temporarily unavailable earlier, which delayed the job).
 
 ## Still to do yourself
 
 1. Commit and push the Slurm templates (`git add . && git commit && git push`).
 2. Dry-run `sync/pull.sh` (no `-y`) once a project has results on the cluster; then run with `-y`.
-3. Submit a smoke test with `cpu.sbatch` from `projects/te_spermatogenesis` on the cluster (not yet run).
+3. Smoke tests done for CPU and GPU via `sbatch --wrap`; the full `cpu.sbatch`/`gpu.sbatch` files themselves have not yet been submitted, so run one short real job with each before a long run.
 4. Before using a fasta from `/opt/resources/genomes`, check a `.fai` exists; if not, build it once by hand before multi-worker jobs.
 5. Check chromosome naming (chr1 vs 1) agrees between fasta, GTF and any cooler/bigwig inputs.
 6. Peer-review material (manuscripts, grants under review) must not go into any AI tool unless the journal/funder allows it.
