@@ -34,6 +34,9 @@ echo "deployed commit: $(cat ../../.deployed_commit 2>/dev/null || echo unknown)
 if ! command -v conda >/dev/null 2>&1; then module load conda 2>/dev/null || module load miniconda 2>/dev/null || true; fi
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV"
+# ignore packages in ~/.local (a numpy 2.x there shadows the env's numpy and breaks deepTools: np.NAN)
+export PYTHONNOUSERSITE=1
+python -c "import numpy; print('numpy', numpy.__version__, numpy.__file__)"
 computeMatrix --version
 
 # ---- 1. feature BEDs (5'UTR / CDS / 3'UTR, spliced BED12, one canonical transcript per gene)
