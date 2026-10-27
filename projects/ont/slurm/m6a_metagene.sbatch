@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # ---- inputs -----------------------------------------------------------------
-BW=/home/ib1618/mnt/storage/vaquerizas/irina/spermatogenesis/ONT_direct_RNA_seq_mouse_testis_bulk/analysis/IGV/M7T1_discover/M7T1.mods.m6A.bw
+BW=/home/mp2924/mnt/storage/vaquerizas/irina/spermatogenesis/ONT_direct_RNA_seq_mouse_testis_bulk/analysis/IGV/M7T1_discover/M7T1.mods.m6A.bw
 GTF=/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/ref_genome/gencode.vM38.annotation.gtf.gz
 CONDA_ENV=deeptools
 

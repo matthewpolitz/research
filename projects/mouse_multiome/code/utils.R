@@ -37,3 +37,14 @@ session_log <- function(dir) {
   writeLines(capture.output(sessionInfo()), file.path(dir, "sessionInfo.txt"))
   writeLines(Sys.getenv("MM_COMMIT", "unknown"), file.path(dir, "deployed_commit.txt"))
 }
+
+# Read the Ernst et al. marker workbook: one sheet per reference cluster; returns long table ref/gene/Top/FDR
+read_ernst_markers <- function(path) {
+  suppressPackageStartupMessages(library(readxl))
+  do.call(rbind, lapply(excel_sheets(path), function(sh) {
+    raw <- suppressMessages(read_excel(path, sheet = sh, col_names = FALSE, .name_repair = "minimal"))
+    h <- which(raw[[1]] == "Top")[1]
+    d <- raw[-seq_len(h), ]; colnames(d) <- as.character(unlist(raw[h, ]))
+    data.frame(ref = sh, gene = d$GeneName, Top = as.numeric(d$Top), FDR = as.numeric(d$FDR), stringsAsFactors = FALSE)
+  }))
+}

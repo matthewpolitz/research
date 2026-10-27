@@ -7,18 +7,20 @@ outd <- res_dir(cfg, "04_annotation")
 obj <- readRDS(file.path(cfg$data_path, "mouse_multiome.integrated.rds"))
 DefaultAssay(obj) <- if (cfg$rna$normalisation == "SCT") "SCT" else "RNA"
 
-# ---- markers ----
-mk <- read_excel(cfg$marker_xlsx, sheet = a$sheet)
-stopifnot(a$cluster_col %in% colnames(mk), a$gene_col %in% colnames(mk))
-mk <- mk |> transmute(ref = as.character(.data[[a$cluster_col]]), gene = as.character(.data[[a$gene_col]]),
-                      rank = if (nzchar(a$rank_col)) .data[[a$rank_col]] else NA)
-if (nzchar(a$rank_col)) mk <- mk |> group_by(ref) |> arrange(desc(rank), .by_group = TRUE)  # edit direction if needed
-mk <- mk |> group_by(ref) |> slice_head(n = a$top_n) |> ungroup()
+# ---- markers (one sheet per reference cluster; see utils.R::read_ernst_markers) ----
 genes_ok <- rownames(obj)
-sets <- split(mk$gene, mk$ref)
-sets <- lapply(sets, function(g) intersect(unique(g), genes_ok))
-cat("Genes found per reference cluster:\n"); print(sapply(sets, length))
-sets <- sets[sapply(sets, length) >= 5]
+mk <- read_ernst_markers(file.path(cfg$project_root, cfg$marker_xlsx))
+mk <- mk |> filter(!is.na(gene), FDR < a$fdr_max, Top <= a$max_top, !grepl(a$drop_gene_regex, gene))
+# Exact symbol matching only. Restrict to genes present in the object BEFORE taking the top n,
+# so genes missing from the annotation do not shrink the marker sets.
+cat("Candidate markers found in object (exact symbol match), per reference cluster:\n")
+print(mk |> group_by(ref) |> summarise(candidates = n(), found = sum(gene %in% genes_ok)) |> as.data.frame())
+mk <- mk |> filter(gene %in% genes_ok) |> arrange(ref, Top, FDR) |>
+  group_by(ref) |> distinct(gene, .keep_all = TRUE) |> slice_head(n = a$top_n) |> ungroup()
+sets <- split(mk$gene, factor(mk$ref, levels = unique(mk$ref)))
+cat("Marker genes per reference cluster used:\n"); print(lengths(sets))
+sets <- sets[lengths(sets) >= a$min_genes]
+write.csv(mk, file.path(outd, "selected_reference_markers.csv"), row.names = FALSE)
 
 # ---- module scores ----
 obj <- AddModuleScore(obj, features = sets, name = "ref_", ctrl = 50, seed = cfg$clustering$seed)
@@ -33,8 +35,10 @@ avg <- aggregate(sc, list(cluster = clus), mean)
 rownames(avg) <- avg$cluster; avg$cluster <- NULL; colnames(avg) <- names(sets)
 best <- apply(avg, 1, function(x) { o <- order(x, decreasing = TRUE); c(names(x)[o[1]], x[o[1]] - x[o[2]]) })
 lab <- data.frame(cluster = rownames(avg), ref_label = best[1, ], margin = as.numeric(best[2, ]))
-lab$confident <- lab$margin > 0.05
+best_score <- apply(avg, 1, max)
+lab$confident <- lab$margin > a$margin
 lab$label <- ifelse(lab$confident, lab$ref_label, paste0(lab$ref_label, "?"))
+lab$label[best_score < a$min_score] <- "other/unassigned?"   # e.g. somatic types absent from the reference
 write.csv(lab, file.path(outd, "cluster_label_proposal.csv"), row.names = FALSE)
 write.csv(avg, file.path(outd, "cluster_x_reference_scores.csv"))
 pheatmap(t(scale(avg)), filename = file.path(outd, "cluster_vs_reference_heatmap.pdf"), width = 9, height = 7)

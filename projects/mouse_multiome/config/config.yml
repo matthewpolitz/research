@@ -3,7 +3,7 @@ project_root: "/home/mp2924/mnt/storage/vaquerizas/Matt/TE_spermatogenesis_proje
 
 # Large inputs live on the cluster storage (not in git)
 cellranger_dir: "/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/cellranger-arc"
-marker_xlsx: "/home/mp2924/mnt/storage/vaquerizas/Matt/mouse_multiome/pre_processing/Ernst_mouse_cluster_marker_genes.xlsx"
+marker_xlsx: "data/Ernst_mouse_cluster_marker_genes.xlsx"   # relative to project_root; local copy, scp to cluster (data/ is not in git)
 
 # Output locations (relative to project_root). data/ = big RDS objects (cluster only); results/ = plots/tables (pulled back)
 data_dir: "data"
@@ -56,13 +56,14 @@ clustering:
   seed: 42
 
 # ---- annotation ----
+# Ernst et al. workbook: one sheet per reference cluster (Spermatogonia, eP1, eP2, mP, lP1, lP2, D, MI, MII,
+# S1-S11, Sertoli, Leydig_1). Each sheet has Top (scran min-rank), p.value, FDR, logFC.<other cluster>..., GeneName.
+# The first sheet has an extra title row above the header; the parser finds the header row by looking for "Top".
 annotation:
-  # Parsing of the Ernst et al. marker xlsx. Run code/00_inspect_markers.R first and set these.
-  sheet: 1
-  cluster_col: "cluster"
-  gene_col: "gene"
-  # optional ranking column used to keep top n markers per reference cluster
-  rank_col: ""
-  top_n: 30
-  # genes are mouse symbols; set to NULL-equivalent "" if they are Ensembl IDs
-  id_type: "symbol"
+  fdr_max: 0.01
+  max_top: 50            # keep genes with scran min-rank "Top" <= this
+  top_n: 40              # then at most this many genes per reference cluster, ordered by Top then FDR
+  min_genes: 5           # drop reference clusters with fewer genes found in the object
+  drop_gene_regex: "^(mt-|Rp[sl][0-9])"   # mitochondrial / ribosomal genes excluded from marker sets
+  min_score: 0.05        # cluster best mean module score below this -> labelled "other/unassigned?"
+  margin: 0.05           # best-vs-second score difference below this -> label gets "?"

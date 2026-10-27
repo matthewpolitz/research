@@ -35,6 +35,6 @@ Then locally: `../../sync/pull.sh` (dry run first, then `-y`).
 ### Caveats
 
 - Untested on the cluster; the `deeptools` conda activation lines may need adjusting.
-- The bigWig sits in another lab member's directory (read access needed).
+- The bigWig is read from Irina's folder via the shared storage mount (read access needed).
 - If the bigWig is unstranded, signal from overlapping antisense genes is included.
 - Check the bigWig's units (modified fraction vs counts) when labelling the y-axis; edit `--ylabel` in `plot_metagene.py` call if needed.
